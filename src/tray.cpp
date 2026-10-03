@@ -506,16 +506,19 @@ void Tray::onActivated(const QSystemTrayIcon::ActivationReason reason)
     {
         case QSystemTrayIcon::Trigger:
         case QSystemTrayIcon::DoubleClick:
-            {
-                auto * menu = new WindowMenu(&d->mNmModel, &d->mConnectivity);
-                menu->setAttribute(Qt::WA_DeleteOnClose);
-                connect(menu, &WindowMenu::requestConnectionInfo, this, &Tray::showConnectionInfo);
-                menu->popup(QCursor::pos());
-            }
+            showNetworkMenu();
             break;
         default:
             break;
     }
+}
+
+void Tray::showNetworkMenu()
+{
+    auto * menu = new WindowMenu(&d->mNmModel, &d->mConnectivity);
+    menu->setAttribute(Qt::WA_DeleteOnClose);
+    connect(menu, &WindowMenu::requestConnectionInfo, this, &Tray::showConnectionInfo);
+    menu->popup(QCursor::pos());
 }
 
 void Tray::setActionsStates()

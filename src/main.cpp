@@ -21,11 +21,15 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 COPYRIGHT_HEADER*/
 #include <QApplication>
+#include <QCommandLineParser>
+#include <QDBusConnection>
+#include <QDBusInterface>
 #include <QDBusMetaType>
 #include <QLockFile>
 #include <QDir>
 #include <QMessageBox>
 #include <QStandardPaths>
+#include <QTimer>
 
 #include "tray.h"
 
@@ -40,6 +44,15 @@ int main(int argc, char * argv[])
     app.setWindowIcon(icons::getIcon(icons::PREFERENCES_NETWORK, true));
     app.setQuitOnLastWindowClosed(false);
 
+    QCommandLineParser parser;
+    parser.setApplicationDescription(QObject::tr("NetworkManager control for LegeOS and tray-based desktops"));
+    parser.addHelpOption();
+    QCommandLineOption popupOption(QStringList{QStringLiteral("p"), QStringLiteral("popup")},
+                                   QObject::tr("Open the network control menu immediately."));
+    parser.addOption(popupOption);
+    parser.process(app);
+    const bool openPopup = parser.isSet(popupOption);
+
     qDBusRegisterMetaType<nm::ConnectionSettings>();
     qDBusRegisterMetaType<QList<uint>>();
 
@@ -50,6 +63,14 @@ int main(int argc, char * argv[])
     QLockFile lock(QDir(runtimeDir).filePath(QStringLiteral("nm-tray-alt.lock")));
     lock.setStaleLockTime(0);
     if (!lock.tryLock(100)) {
+        if (openPopup) {
+            QDBusInterface running(QStringLiteral("org.legeos.NetworkTray"),
+                                   QStringLiteral("/org/legeos/NetworkTray"),
+                                   QString(),
+                                   QDBusConnection::sessionBus());
+            running.call(QDBus::NoBlock, QStringLiteral("showNetworkMenu"));
+            return 0;
+        }
         QMessageBox::information(nullptr,
                                  QObject::tr("nm-tray-alt"),
                                  QObject::tr("nm-tray-alt is already running."));
@@ -57,6 +78,14 @@ int main(int argc, char * argv[])
     }
 
     Tray tray;
+    auto bus = QDBusConnection::sessionBus();
+    bus.registerService(QStringLiteral("org.legeos.NetworkTray"));
+    bus.registerObject(QStringLiteral("/org/legeos/NetworkTray"),
+                       &tray,
+                       QDBusConnection::ExportAllSlots);
+    if (openPopup) {
+        QTimer::singleShot(0, &tray, &Tray::showNetworkMenu);
+    }
     
     return app.exec();
 }

@@ -27,8 +27,8 @@ include(GNUInstallDirs)
 set(TRANSLATION_DIR "${CMAKE_INSTALL_FULL_DATADIR}/${PROJECT_NAME}")
 add_definitions(-DQT_NO_SIGNALS_SLOTS_KEYWORDS "-DTRANSLATION_DIR=\"${TRANSLATION_DIR}\"" "-DNM_TRAY_VERSION=\"${NM_TRAY_VERSION}\"")
 if (NOT NM_TRAY_XDG_AUTOSTART_DIR)
-    #Note: we need the default to be /etc... (not the ${CMAKE_INSTALL_PREFIX}/etc)
-    set(NM_TRAY_XDG_AUTOSTART_DIR "${CMAKE_INSTALL_SYSCONFDIR}/xdg/autostart")
+    # XDG_CONFIG_DIRS normally includes /etc/xdg, not ${CMAKE_INSTALL_PREFIX}/etc/xdg.
+    set(NM_TRAY_XDG_AUTOSTART_DIR "/etc/xdg/autostart")
 endif ()
 
 message(STATUS "Translations destination dir: ${TRANSLATION_DIR}")

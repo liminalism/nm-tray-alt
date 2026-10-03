@@ -51,6 +51,16 @@ Run without installing:
 ./build/nm-tray
 ```
 
+Open the full network menu directly, including on LegeOS where there is deliberately no
+taskbar/system-tray host:
+
+```bash
+./build/nm-tray --popup
+```
+
+If nm-tray-alt is already running, `--popup` forwards the request to that process over the
+session bus instead of starting a duplicate.
+
 ## Install System-Wide
 
 ```bash
@@ -73,4 +83,3 @@ This installs:
 - Networking is still managed by NetworkManager (`network-manager` service).
 - If another tray applet is already autostarting, disable it to avoid duplicate tray icons.
 - `Edit connections...` tries multiple launch fallbacks (`nm-connection-editor`, terminal + `nmtui-edit`).
-

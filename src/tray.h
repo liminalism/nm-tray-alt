@@ -37,6 +37,10 @@ public:
     Tray(QObject *parent = nullptr);
     ~Tray();
 
+public Q_SLOTS:
+    /// Open the full network menu without requiring a system-tray host.
+    void showNetworkMenu();
+
 protected:
     virtual bool eventFilter(QObject * object, QEvent * event) override;
 

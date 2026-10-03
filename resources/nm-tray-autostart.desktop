@@ -5,3 +5,6 @@ TryExec=nm-tray
 Exec=nm-tray
 NotShowIn=KDE;GNOME;
 X-LXQt-Need-Tray=true
+X-LegeOS-Provides=network-status-ui
+X-TemplarOS-Provides=network-status-ui
+X-LegeOS-Background=login-autostart,continuous-background,network-while-hidden,notifications
