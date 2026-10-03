@@ -6,3 +6,4 @@ Icon=network-transmit
 TryExec=nm-tray
 Exec=nm-tray
 Categories=System;Monitor;Qt;
+X-TemplarOS-Provides=network-status-ui
