@@ -107,6 +107,7 @@ NmDbusClient::NmDbusClient(QObject *parent)
     : QObject(parent)
 {
     mRefreshDebounce.setParent(this);
+    mSteering = new ApSteeringMonitor(this);
 }
 
 void NmDbusClient::start()
@@ -130,6 +131,7 @@ void NmDbusClient::start()
                 if (newOwner.isEmpty()) {
                     mDynamicPropertyPaths.clear();
                     mSnapshot = {};
+                    mSteering->reset();
                     emit snapshotChanged(mSnapshot);
                     emit managerStateChanged();
                     return;
@@ -380,6 +382,9 @@ void NmDbusClient::refreshSnapshot()
             ap.rsnFlags = apProps.value(QStringLiteral("RsnFlags")).toUInt();
             ap.frequency = apProps.value(QStringLiteral("Frequency")).toUInt();
             ap.privacy = (ap.flags & 0x1U) != 0U;
+            ap.lastSeen = apProps.contains(QStringLiteral("LastSeen"))
+                ? apProps.value(QStringLiteral("LastSeen")).toInt()
+                : -1;
             next.accessPoints.insert(apPath, ap);
         }
     }
@@ -409,6 +414,7 @@ void NmDbusClient::refreshSnapshot()
         conn.uuid = connection.value(QStringLiteral("uuid")).toString();
         conn.type = connection.value(QStringLiteral("type")).toString();
         conn.interfaceName = connection.value(QStringLiteral("interface-name")).toString();
+        conn.wifiBssid = wifi.value(QStringLiteral("bssid")).toString();
         conn.timestamp = connection.value(QStringLiteral("timestamp")).toLongLong();
         conn.autoconnectPriority = connection.value(QStringLiteral("autoconnect-priority")).toInt();
         conn.autoconnect = connection.value(QStringLiteral("autoconnect"), true).toBool();
@@ -465,6 +471,13 @@ void NmDbusClient::refreshSnapshot()
 
     const bool changed = !(next == mSnapshot);
     updateDynamicPropertySubscriptions(next);
+    QList<QString> wifiDevices;
+    for (const auto &dev : next.devices) {
+        if (dev.type == DeviceType::Wifi) {
+            wifiDevices.push_back(dev.path);
+        }
+    }
+    mSteering->reconcileDevices(wifiDevices);
     mSnapshot = std::move(next);
     if (managerChanged) {
         emit managerStateChanged();

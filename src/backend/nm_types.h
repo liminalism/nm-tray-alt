@@ -19,6 +19,38 @@ enum class DeviceType : uint32_t
     Wifi = 2,
 };
 
+// Numeric values follow the libnm NMDeviceState / NMDeviceStateReason enums
+// (verified against the installed NM 1.52 typelib); only the states the tray
+// matches on are listed.
+enum class DeviceState : uint32_t
+{
+    Unknown = 0,
+    Unmanaged = 10,
+    Unavailable = 20,
+    Disconnected = 30,
+    Prepare = 40,
+    Config = 50,
+    NeedAuth = 60,
+    IpConfig = 70,
+    IpCheck = 80,
+    Secondaries = 90,
+    Activated = 100,
+    Deactivating = 110,
+    Failed = 120,
+};
+
+enum class DeviceStateReason : uint32_t
+{
+    Unknown = 0,
+    None = 1,
+    IpConfigUnavailable = 5,
+    IpConfigExpired = 6,
+    NoSecrets = 7,
+    SupplicantTimeout = 11,
+    DhcpFailed = 17,
+    NewActivation = 60,
+};
+
 enum class ActiveState : uint32_t
 {
     Unknown = 0,
@@ -41,8 +73,25 @@ struct AccessPointRecord
     uint32_t rsnFlags = 0;
     uint32_t frequency = 0;
     bool privacy = false;
+    // CLOCK_BOOTTIME seconds when NM last saw this AP (-1 = unknown). Used by
+    // the steering guard's freshness rule; excluded from == like collectedAt
+    // so ticking timestamps don't mark every snapshot changed.
+    int lastSeen = -1;
 
-    bool operator==(const AccessPointRecord &) const = default;
+    bool operator==(const AccessPointRecord &other) const
+    {
+        return path == other.path
+            && devicePath == other.devicePath
+            && ssid == other.ssid
+            && ssidBytes == other.ssidBytes
+            && bssid == other.bssid
+            && strength == other.strength
+            && flags == other.flags
+            && wpaFlags == other.wpaFlags
+            && rsnFlags == other.rsnFlags
+            && frequency == other.frequency
+            && privacy == other.privacy;
+    }
 };
 
 struct DeviceRecord
@@ -74,6 +123,8 @@ struct SavedConnectionRecord
     QString uuid;
     QString type;
     QString interfaceName;
+    // 802-11-wireless.bssid pin, if the profile carries one (empty = unpinned).
+    QString wifiBssid;
     qint64 timestamp = 0;
     int autoconnectPriority = 0;
     bool autoconnect = true;

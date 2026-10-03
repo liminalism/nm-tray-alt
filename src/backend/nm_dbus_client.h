@@ -1,6 +1,7 @@
 #ifndef NM_DBUS_CLIENT_H
 #define NM_DBUS_CLIENT_H
 
+#include "ap_steering.h"
 #include "nm_types.h"
 
 #include <QObject>
@@ -17,6 +18,8 @@ class NmDbusClient : public QObject
 
 public:
     explicit NmDbusClient(QObject *parent = nullptr);
+
+    ApSteeringMonitor *steeringMonitor() const { return mSteering; }
 
 Q_SIGNALS:
     void snapshotChanged(const Snapshot &snapshot);
@@ -37,6 +40,7 @@ private:
     void updateDynamicPropertySubscriptions(const Snapshot &snapshot);
 
     Snapshot mSnapshot;
+    ApSteeringMonitor *mSteering = nullptr;
     QTimer mRefreshDebounce;
     bool mStarted = false;
     bool mRefreshInProgress = false;

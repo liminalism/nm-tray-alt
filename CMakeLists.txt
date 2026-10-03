@@ -42,6 +42,7 @@ set(SRCS
     src/backend/wifi_activation_watcher.cpp
     src/backend/tray_secret_agent.cpp
     src/backend/nm_dbus_client.cpp
+    src/backend/ap_steering.cpp
     src/backend/nm_actions.cpp
     src/backend/nm_cache.cpp
     src/nmmodel.cpp
