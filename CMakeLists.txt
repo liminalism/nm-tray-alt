@@ -97,3 +97,21 @@ install(FILES ${QMS} DESTINATION "${TRANSLATION_DIR}" COMPONENT translations)
 install(FILES "resources/nm-tray.desktop" DESTINATION "${CMAKE_INSTALL_FULL_DATAROOTDIR}/applications" COMPONENT data)
 install(FILES "resources/nm-tray-autostart.desktop" DESTINATION "${NM_TRAY_XDG_AUTOSTART_DIR}" COMPONENT data)
 install(FILES "resources/nm-tray.conf" DESTINATION "${CMAKE_INSTALL_FULL_DATADIR}/${PROJECT_NAME}" COMPONENT data)
+
+include(CTest)
+if (BUILD_TESTING)
+    find_package(Qt6 REQUIRED COMPONENTS Test)
+    add_executable(test_ap_steering
+        tests/test_ap_steering.cpp
+        src/backend/ap_steering.cpp
+        src/log.cpp
+    )
+    set_property(TARGET test_ap_steering PROPERTY CXX_STANDARD 23)
+    set_property(TARGET test_ap_steering PROPERTY CXX_STANDARD_REQUIRED on)
+    target_link_libraries(test_ap_steering
+        Qt6::Test
+        Qt6::Core
+        Qt6::DBus
+    )
+    add_test(NAME ap_steering COMMAND test_ap_steering)
+endif()
