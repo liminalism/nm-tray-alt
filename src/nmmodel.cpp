@@ -1,5 +1,6 @@
 #include "nmmodel.h"
 
+#include "backend/ap_steering.h"
 #include "backend/nm_actions.h"
 #include "backend/wifi_activation_watcher.h"
 #include "icons.h"
@@ -55,7 +56,8 @@ struct WifiTarget
 
 WifiTarget pickWifiTarget(const nm::Snapshot &snapshot,
                           const QString &ifaceHint,
-                          const QByteArray &ssidBytes)
+                          const QByteArray &ssidBytes,
+                          const QString &profileBssid = {})
 {
     WifiTarget fallback;
     for (const auto &dev : snapshot.devices) {
@@ -73,12 +75,31 @@ WifiTarget pickWifiTarget(const nm::Snapshot &snapshot,
         }
         for (const QString &apPath : dev.accessPointPaths) {
             const auto apIt = snapshot.accessPoints.find(apPath);
-            if (apIt != snapshot.accessPoints.end() && apIt->ssidBytes == ssidBytes) {
-                return { dev.path, apPath };
+            if (apIt == snapshot.accessPoints.end() || apIt->ssidBytes != ssidBytes) {
+                continue;
             }
+            if (!profileBssid.isEmpty()
+                && apIt->bssid.compare(profileBssid, Qt::CaseInsensitive) != 0) {
+                // A pinned profile must only ever target its pin; anything
+                // else would fight the profile and fail. When the pin is not
+                // visible anywhere we fall through to "/" below so NM fails
+                // fast and the steering monitor can clear the stale pin.
+                continue;
+            }
+            return { dev.path, apPath };
         }
     }
     return fallback;
+}
+
+bool isSettingsAuthError(const QString &error)
+{
+    // NM/polkit denial surface after humanActionError mapping (which never
+    // rewrites these substrings): Settings.PermissionDenied, D-Bus
+    // AccessDenied, "not authorized", PolicyKit failures.
+    const QString lower = error.toLower();
+    return lower.contains(QStringLiteral("permission")) || lower.contains(QStringLiteral("denied"))
+        || lower.contains(QStringLiteral("not authorized")) || lower.contains(QStringLiteral("notauthoriz"));
 }
 
 QString firstObjectPathFromReply(const QDBusMessage &reply)
@@ -167,11 +188,31 @@ NmModel::NmModel(QObject *parent)
     : QAbstractItemModel(parent)
 {
     qRegisterMetaType<nm::Snapshot>();
+    qRegisterMetaType<nm::SteerRequest>();
 
     mDbus = new nm::NmDbusClient;
     mDbus->moveToThread(&mDbusThread);
     connect(&mDbusThread, &QThread::finished, mDbus, &QObject::deleteLater);
     connect(mDbus, &nm::NmDbusClient::snapshotChanged, this, &NmModel::onSnapshotChanged, Qt::QueuedConnection);
+    connect(mDbus->steeringMonitor(),
+            &nm::ApSteeringMonitor::steerRequested,
+            this,
+            &NmModel::onApSteerRequested,
+            Qt::QueuedConnection);
+    connect(mDbus->steeringMonitor(),
+            &nm::ApSteeringMonitor::stalePinDetected,
+            this,
+            &NmModel::onApPinStale,
+            Qt::QueuedConnection);
+    connect(mDbus->steeringMonitor(),
+            &nm::ApSteeringMonitor::steeringBlocked,
+            this,
+            &NmModel::onSteeringBlocked,
+            Qt::QueuedConnection);
+
+    mRedirectBackstop.setSingleShot(true);
+    mRedirectBackstop.setInterval(120000);
+    connect(&mRedirectBackstop, &QTimer::timeout, this, &NmModel::clearStaleRedirects);
 
     mDbusThread.start();
     QMetaObject::invokeMethod(mDbus, "start", Qt::QueuedConnection);
@@ -751,7 +792,8 @@ void NmModel::activateConnection(const QModelIndex &index)
             const auto sIt = mCache.snapshot().savedConnections.find(conn.connectionPath);
             const QString ifaceHint = sIt == mCache.snapshot().savedConnections.end() ? QString{} : sIt->interfaceName;
             const QByteArray ssidBytes = sIt == mCache.snapshot().savedConnections.end() ? QByteArray{} : sIt->wifiSsidBytes;
-            const WifiTarget target = pickWifiTarget(mCache.snapshot(), ifaceHint, ssidBytes);
+            const QString profileBssid = sIt == mCache.snapshot().savedConnections.end() ? QString{} : sIt->wifiBssid;
+            const WifiTarget target = pickWifiTarget(mCache.snapshot(), ifaceHint, ssidBytes, profileBssid);
             if (target.devicePath.isEmpty()) {
                 emit actionFailed(tr("No usable Wi-Fi adapter"), tr("Enable Wi-Fi and try again."));
                 return;
@@ -1284,15 +1326,22 @@ void NmModel::connectToWifi(const nm::WifiViewRecord &wifi)
         return;
     }
 
-    const WifiTarget target = pickWifiTarget(mCache.snapshot(), {}, apIt->ssidBytes);
-    if (target.devicePath.isEmpty()) {
-        emit actionFailed(tr("No usable Wi-Fi adapter"), tr("Enable Wi-Fi and try again."));
-        return;
-    }
-
     QString savedConnectionPath = wifi.savedConnectionPath;
     if (savedConnectionPath.isEmpty()) {
         savedConnectionPath = mCache.connectionPathForSsid(wifi.ssid);
+    }
+    QString profileBssid;
+    if (!savedConnectionPath.isEmpty()) {
+        const auto sIt = mCache.snapshot().savedConnections.find(savedConnectionPath);
+        if (sIt != mCache.snapshot().savedConnections.end()) {
+            profileBssid = sIt->wifiBssid;
+        }
+    }
+
+    const WifiTarget target = pickWifiTarget(mCache.snapshot(), {}, apIt->ssidBytes, profileBssid);
+    if (target.devicePath.isEmpty()) {
+        emit actionFailed(tr("No usable Wi-Fi adapter"), tr("Enable Wi-Fi and try again."));
+        return;
     }
 
     if (!savedConnectionPath.isEmpty()) {
@@ -1322,12 +1371,180 @@ void NmModel::connectToWifi(const nm::WifiViewRecord &wifi)
     promptAndCreateWifiConnection(wifi.ssid, target.devicePath, wifi.secure);
 }
 
+quint64 NmModel::markSteerRedirect(const QString &devicePath)
+{
+    mSteerSeq += 1;
+    mSteerRedirects.insert(devicePath, mSteerSeq);
+    mRedirectBackstop.start();
+    return mSteerSeq;
+}
+
+bool NmModel::redirectLive(const QString &devicePath, quint64 seq) const
+{
+    return mSteerRedirects.value(devicePath, 0) == seq;
+}
+
+void NmModel::clearSteerRedirect(const QString &devicePath)
+{
+    mSteerRedirects.remove(devicePath);
+}
+
+void NmModel::clearStaleRedirects()
+{
+    if (mSteerRedirects.isEmpty()) {
+        return;
+    }
+    qCWarning(NM_TRAY).noquote() << QStringLiteral("steering: %1 redirect(s) never settled; "
+                                                   "clearing migration state")
+                                       .arg(mSteerRedirects.size());
+    mSteerRedirects.clear();
+    emit migrationActiveChanged(false);
+}
+
+nm::WifiViewRecord NmModel::synthWifiForRedirect(const nm::SteerRequest &request) const
+{
+    nm::WifiViewRecord wifi;
+    wifi.ssid = request.ssid;
+    wifi.apPath = request.targetApPath;
+    wifi.devicePath = request.devicePath;
+    wifi.savedConnectionPath = request.settingsPath;
+    wifi.secure = true;
+    const auto &snap = mCache.snapshot();
+    const auto sIt = snap.savedConnections.find(request.settingsPath);
+    if (sIt != snap.savedConnections.end() && !sIt->wifiSsidBytes.isEmpty()) {
+        wifi.ssidBytes = sIt->wifiSsidBytes;
+    } else {
+        wifi.ssidBytes = request.ssid.toUtf8();
+    }
+    const auto aIt = snap.accessPoints.find(request.targetApPath);
+    if (aIt != snap.accessPoints.end()) {
+        wifi.strength = aIt->strength;
+        wifi.secure = aIt->privacy || aIt->wpaFlags != 0 || aIt->rsnFlags != 0;
+    }
+    return wifi;
+}
+
+void NmModel::suppressSteeringFor(const QString &settingsPath)
+{
+    QMetaObject::invokeMethod(mDbus->steeringMonitor(),
+                              "suppressProfile",
+                              Qt::QueuedConnection,
+                              Q_ARG(QString, settingsPath));
+}
+
+void NmModel::onApSteerRequested(const nm::SteerRequest &request)
+{
+    const auto &snap = mCache.snapshot();
+    const auto devIt = snap.devices.find(request.devicePath);
+    if (devIt != snap.devices.end()
+        && devIt->state == static_cast<uint>(nm::DeviceState::Activated)
+        && devIt->activeAccessPointPath == request.targetApPath) {
+        qCDebug(NM_TRAY).noquote() << QStringLiteral("steering: %1 already on %2; ignoring")
+                                         .arg(request.settingsPath, request.targetBssid);
+        return;
+    }
+    const quint64 seq = markSteerRedirect(request.devicePath);
+    emit migrationActiveChanged(true);
+    qCWarning(NM_TRAY).noquote()
+        << QStringLiteral("steering: pinning %1 to %2 (was failing on %3)")
+               .arg(request.settingsPath, request.targetBssid, request.failedBssid);
+    nm::NmActions::setBssidPin(request.settingsPath, request.targetBssid, this,
+        [this, request, seq](bool ok, const QString &err, const QDBusMessage &) {
+            if (!ok) {
+                if (isSettingsAuthError(err)) {
+                    suppressSteeringFor(request.settingsPath);
+                } else {
+                    qCWarning(NM_TRAY).noquote()
+                        << QStringLiteral("steering: pin write failed for '%1': %2").arg(request.ssid, err);
+                }
+                emit migrationUpdate(tr("Could not steer %1").arg(request.ssid), err);
+                clearSteerRedirect(request.devicePath);
+                emit migrationActiveChanged(false);
+                return;
+            }
+            nm::NmActions::activateConnection(request.settingsPath,
+                                             request.devicePath,
+                                             request.targetApPath,
+                                             this,
+                [this, request, seq](bool ok2, const QString &err2, const QDBusMessage &reply2) {
+                    if (!ok2) {
+                        qCWarning(NM_TRAY).noquote()
+                            << QStringLiteral("steering: reactivation failed for '%1': %2")
+                                   .arg(request.ssid, err2);
+                        emit migrationUpdate(tr("Could not steer %1").arg(request.ssid), err2);
+                        clearSteerRedirect(request.devicePath);
+                        emit migrationActiveChanged(false);
+                        return;
+                    }
+                    const nm::WifiViewRecord wifi = synthWifiForRedirect(request);
+                    startActivationWatch(firstObjectPathFromReply(reply2),
+                                         wifi,
+                                         request.settingsPath,
+                                         request.devicePath,
+                                         request.targetApPath,
+                                         true,
+                                         seq);
+                });
+        });
+}
+
+void NmModel::onApPinStale(const QString &devicePath, const QString &settingsPath, const QString &currentPin)
+{
+    qCWarning(NM_TRAY).noquote() << QStringLiteral("steering: clearing stale pin %1 on %2")
+                                       .arg(currentPin, settingsPath);
+    const quint64 seq = markSteerRedirect(devicePath);
+    emit migrationActiveChanged(true);
+    nm::NmActions::clearBssidPin(settingsPath, this,
+        [this, devicePath, settingsPath, currentPin, seq](bool ok, const QString &err, const QDBusMessage &) {
+            if (!ok) {
+                if (isSettingsAuthError(err)) {
+                    suppressSteeringFor(settingsPath);
+                }
+                emit migrationUpdate(tr("Could not clear the stale access-point pin"), err);
+                clearSteerRedirect(devicePath);
+                emit migrationActiveChanged(false);
+                return;
+            }
+            nm::NmActions::activateConnection(settingsPath, devicePath, QStringLiteral("/"), this,
+                [this, devicePath, settingsPath, seq](bool ok2, const QString &err2, const QDBusMessage &reply2) {
+                    if (!ok2) {
+                        emit migrationUpdate(tr("Could not reconnect after clearing the pin"), err2);
+                        clearSteerRedirect(devicePath);
+                        emit migrationActiveChanged(false);
+                        return;
+                    }
+                    nm::SteerRequest request;
+                    request.devicePath = devicePath;
+                    request.settingsPath = settingsPath;
+                    const auto &snap = mCache.snapshot();
+                    const auto sIt = snap.savedConnections.find(settingsPath);
+                    request.ssid = sIt != snap.savedConnections.end() ? sIt->id : QString{};
+                    const nm::WifiViewRecord wifi = synthWifiForRedirect(request);
+                    startActivationWatch(firstObjectPathFromReply(reply2),
+                                         wifi,
+                                         settingsPath,
+                                         devicePath,
+                                         QStringLiteral("/"),
+                                         true,
+                                         seq);
+                });
+        });
+}
+
+void NmModel::onSteeringBlocked(const QString &settingsPath, const QString &ssid, const QString &reason)
+{
+    qCWarning(NM_TRAY).noquote()
+        << QStringLiteral("steering: blocked for %1: %2").arg(settingsPath, reason);
+    emit migrationUpdate(tr("Automatic Wi-Fi steering paused for %1").arg(ssid), reason);
+}
+
 void NmModel::startActivationWatch(const QString &activeConnectionPath,
                                    const nm::WifiViewRecord &wifi,
                                    const QString &settingsPath,
                                    const QString &devicePath,
                                    const QString &apPath,
-                                   bool savedActivation)
+                                   bool savedActivation,
+                                   quint64 redirectSeq)
 {
     if (activeConnectionPath.isEmpty()) {
         return;
@@ -1335,9 +1552,26 @@ void NmModel::startActivationWatch(const QString &activeConnectionPath,
 
     auto *watcher = new nm::WifiActivationWatcher(activeConnectionPath, this);
     connect(watcher, &nm::WifiActivationWatcher::finished, this,
-            [this, watcher, wifi, settingsPath, devicePath, apPath, savedActivation](nm::WifiActivationWatcher::Outcome outcome,
+            [this, watcher, wifi, settingsPath, devicePath, apPath, savedActivation, redirectSeq](nm::WifiActivationWatcher::Outcome outcome,
                                                                                     const QString &message) {
                 watcher->deleteLater();
+                if (redirectSeq != 0) {
+                    // Steering-redirect coverage: a superseded redirect (a newer
+                    // steer already re-marked this device) stays fully silent so
+                    // stale outcomes never contradict the live one.
+                    if (!redirectLive(devicePath, redirectSeq)) {
+                        return;
+                    }
+                    clearSteerRedirect(devicePath);
+                    emit migrationActiveChanged(false);
+                    if (outcome == nm::WifiActivationWatcher::Outcome::Success) {
+                        emit migrationUpdate(tr("Wi-Fi steered to a working access point"),
+                                             tr("%1 reconnected.").arg(wifi.ssid));
+                    } else {
+                        emit migrationUpdate(tr("Could not steer %1").arg(wifi.ssid), message);
+                    }
+                    return;
+                }
                 if (outcome == nm::WifiActivationWatcher::Outcome::Success) {
                     return;
                 }

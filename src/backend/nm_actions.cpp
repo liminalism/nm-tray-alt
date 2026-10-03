@@ -5,6 +5,10 @@
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
 #include <QDBusVariant>
+#include <QList>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QSet>
 #include <QtEndian>
 
 namespace
@@ -182,7 +186,131 @@ void NmActions::setWirelessEnabled(bool enabled, QObject *ctx, AsyncResult done)
     callAsync(std::move(msg), ctx, std::move(done));
 }
 
-void NmActions::setConnectionAutoconnect(const QString &connectionPath, bool enabled, QObject *ctx, AsyncResult done)
+namespace
+{
+
+struct PendingSettingsWrite
+{
+    QObject *ctx = nullptr;
+    nm::SettingsMutator mutate;
+    nm::AsyncResult done;
+};
+
+// Serializes GetSettings -> mutate -> Update round-trips per connection path.
+// Completions hop threads via callAsync/ctx, so all queue state is mutex
+// guarded; the pump runs from completion handlers (event-loop delivered, no
+// stack growth).
+class SettingsWriteQueue
+{
+public:
+    void enqueue(const QString &path, QObject *ctx, nm::SettingsMutator mutate, nm::AsyncResult done)
+    {
+        {
+            QMutexLocker lock(&mMutex);
+            if (mBusy.contains(path)) {
+                PendingSettingsWrite pending;
+                pending.ctx = ctx;
+                pending.mutate = std::move(mutate);
+                pending.done = std::move(done);
+                mQueues[path].push_back(std::move(pending));
+                return;
+            }
+            mBusy.insert(path);
+        }
+        runHead(path, ctx, std::move(mutate), std::move(done));
+    }
+
+private:
+    void runHead(const QString &path, QObject *ctx, nm::SettingsMutator mutate, nm::AsyncResult done)
+    {
+        // The watchers below are deliberately unparented (null ctx): a caller
+        // that dies mid-round-trip must not take the completion (and the pump)
+        // with it, or this path would stay busy forever. done-callback safety
+        // stays the caller's contract, as with every other NmActions call.
+        Q_UNUSED(ctx);
+        QDBusMessage get = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
+                                                          path,
+                                                          QString::fromLatin1(kSettingsConnIface),
+                                                          QStringLiteral("GetSettings"));
+        nm::NmActions::callAsync(std::move(get),
+                                 nullptr,
+                                 [this, path, mutate = std::move(mutate), done = std::move(done)](
+                                     bool ok, const QString &err, const QDBusMessage &reply) mutable {
+                                     if (!ok) {
+                                         if (done) {
+                                             done(false, err, reply);
+                                         }
+                                         pump(path);
+                                         return;
+                                     }
+                                     nm::ConnectionSettings settings = settingsFromReply(reply);
+                                     if (!mutate(settings)) {
+                                         if (done) {
+                                             done(true, {}, QDBusMessage{});
+                                         }
+                                         pump(path);
+                                         return;
+                                     }
+                                     QDBusMessage update =
+                                         QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
+                                                                        path,
+                                                                        QString::fromLatin1(kSettingsConnIface),
+                                                                        QStringLiteral("Update"));
+                                     update << QVariant::fromValue(settings);
+                                     nm::NmActions::callAsync(std::move(update),
+                                                              nullptr,
+                                                              [this, path, done = std::move(done)](
+                                                                  bool ok2,
+                                                                  const QString &err2,
+                                                                  const QDBusMessage &reply2) mutable {
+                                                                  if (done) {
+                                                                      done(ok2, err2, reply2);
+                                                                  }
+                                                                  pump(path);
+                                                              });
+                                 });
+    }
+
+    void pump(const QString &path)
+    {
+        PendingSettingsWrite next;
+        bool haveNext = false;
+        {
+            QMutexLocker lock(&mMutex);
+            auto it = mQueues.find(path);
+            if (it != mQueues.end() && !it->isEmpty()) {
+                next = std::move(it->first());
+                it->removeFirst();
+                if (it->isEmpty()) {
+                    mQueues.erase(it);
+                }
+                haveNext = true;
+            } else {
+                mBusy.remove(path);
+            }
+        }
+        if (haveNext) {
+            runHead(path, next.ctx, std::move(next.mutate), std::move(next.done));
+        }
+    }
+
+    QMutex mMutex;
+    QSet<QString> mBusy;
+    QMap<QString, QList<PendingSettingsWrite>> mQueues;
+};
+
+SettingsWriteQueue *writeQueue()
+{
+    static SettingsWriteQueue queue;
+    return &queue;
+}
+
+} // namespace
+
+void NmActions::updateConnectionSettings(const QString &connectionPath,
+                                         QObject *ctx,
+                                         SettingsMutator mutate,
+                                         AsyncResult done)
 {
     if (connectionPath.isEmpty() || connectionPath == QStringLiteral("/")) {
         if (done) {
@@ -190,31 +318,54 @@ void NmActions::setConnectionAutoconnect(const QString &connectionPath, bool ena
         }
         return;
     }
+    writeQueue()->enqueue(connectionPath, ctx, std::move(mutate), std::move(done));
+}
 
-    QDBusMessage get = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
-                                                      connectionPath,
-                                                      QString::fromLatin1(kSettingsConnIface),
-                                                      QStringLiteral("GetSettings"));
-    callAsync(std::move(get), ctx,
-              [connectionPath, enabled, ctx, done = std::move(done)](bool ok, const QString &err, const QDBusMessage &reply) mutable {
-                  if (!ok) {
-                      if (done) {
-                          done(false, err, reply);
-                      }
-                      return;
-                  }
-                  ConnectionSettings settings = settingsFromReply(reply);
-                  QVariantMap connection = settings.value(QStringLiteral("connection"));
-                  connection.insert(QStringLiteral("autoconnect"), enabled);
-                  settings.insert(QStringLiteral("connection"), connection);
+void NmActions::setBssidPin(const QString &connectionPath, const QString &bssid, QObject *ctx, AsyncResult done)
+{
+    updateConnectionSettings(connectionPath,
+                             ctx,
+                             [bssid](ConnectionSettings &settings) {
+                                 QVariantMap wifi = settings.value(QStringLiteral("802-11-wireless"));
+                                 if (wifi.value(QStringLiteral("bssid")).toString().compare(
+                                         bssid, Qt::CaseInsensitive)
+                                     == 0) {
+                                     return false;
+                                 }
+                                 wifi.insert(QStringLiteral("bssid"), bssid);
+                                 settings.insert(QStringLiteral("802-11-wireless"), wifi);
+                                 return true;
+                             },
+                             std::move(done));
+}
 
-                  QDBusMessage update = QDBusMessage::createMethodCall(QString::fromLatin1(kNmService),
-                                                                       connectionPath,
-                                                                       QString::fromLatin1(kSettingsConnIface),
-                                                                       QStringLiteral("Update"));
-                  update << QVariant::fromValue(settings);
-                  callAsync(std::move(update), ctx, std::move(done));
-              });
+void NmActions::clearBssidPin(const QString &connectionPath, QObject *ctx, AsyncResult done)
+{
+    updateConnectionSettings(connectionPath,
+                             ctx,
+                             [](ConnectionSettings &settings) {
+                                 QVariantMap wifi = settings.value(QStringLiteral("802-11-wireless"));
+                                 if (!wifi.contains(QStringLiteral("bssid"))) {
+                                     return false;
+                                 }
+                                 wifi.remove(QStringLiteral("bssid"));
+                                 settings.insert(QStringLiteral("802-11-wireless"), wifi);
+                                 return true;
+                             },
+                             std::move(done));
+}
+
+void NmActions::setConnectionAutoconnect(const QString &connectionPath, bool enabled, QObject *ctx, AsyncResult done)
+{
+    updateConnectionSettings(connectionPath,
+                             ctx,
+                             [enabled](ConnectionSettings &settings) {
+                                 QVariantMap connection = settings.value(QStringLiteral("connection"));
+                                 connection.insert(QStringLiteral("autoconnect"), enabled);
+                                 settings.insert(QStringLiteral("connection"), connection);
+                                 return true;
+                             },
+                             std::move(done));
 }
 
 void NmActions::addAndActivateWifi(const AccessPointRecord &ap,

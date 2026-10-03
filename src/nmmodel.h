@@ -2,7 +2,9 @@
 #define NMMODEL_H
 
 #include <QAbstractItemModel>
+#include <QMap>
 #include <QThread>
+#include <QTimer>
 #include <QString>
 #include <QStringList>
 
@@ -130,6 +132,8 @@ public:
 Q_SIGNALS:
     void managerStateChanged();
     void actionFailed(const QString &summary, const QString &detail);
+    void migrationUpdate(const QString &summary, const QString &detail);
+    void migrationActiveChanged(bool active);
 
 public Q_SLOTS:
     void activateConnection(const QModelIndex &index);
@@ -173,7 +177,17 @@ private:
                               const QString &settingsPath,
                               const QString &devicePath,
                               const QString &apPath,
-                              bool savedActivation);
+                              bool savedActivation,
+                              quint64 redirectSeq = 0);
+    void onApSteerRequested(const nm::SteerRequest &request);
+    void onApPinStale(const QString &devicePath, const QString &settingsPath, const QString &currentPin);
+    void onSteeringBlocked(const QString &settingsPath, const QString &ssid, const QString &reason);
+    void clearStaleRedirects();
+    void suppressSteeringFor(const QString &settingsPath);
+    quint64 markSteerRedirect(const QString &devicePath);
+    bool redirectLive(const QString &devicePath, quint64 seq) const;
+    void clearSteerRedirect(const QString &devicePath);
+    nm::WifiViewRecord synthWifiForRedirect(const nm::SteerRequest &request) const;
     void promptForUpdatedWifiPassword(const nm::WifiViewRecord &wifi,
                                       const QString &settingsPath,
                                       const QString &devicePath,
@@ -191,6 +205,9 @@ private:
     ManagerState mManagerState;
     bool mShowLowSignalNetworks = false;
     bool mOrderHeld = false;
+    QMap<QString, quint64> mSteerRedirects;
+    quint64 mSteerSeq = 0;
+    QTimer mRedirectBackstop;
 };
 
 #endif // NMMODEL_H

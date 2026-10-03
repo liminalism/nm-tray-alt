@@ -14,6 +14,9 @@ namespace nm
 
 using ConnectionSettings = QMap<QString, QVariantMap>;
 using AsyncResult = std::function<void(bool ok, const QString &error, const QDBusMessage &reply)>;
+// Mutates fetched settings in place. Return false when no write is needed;
+// updateConnectionSettings then reports success with a default (skipped) reply.
+using SettingsMutator = std::function<bool(ConnectionSettings &)>;
 
 QString humanActionError(const QString &raw);
 QString keyMgmtForAp(uint32_t wpaFlags, uint32_t rsnFlags, bool privacy);
@@ -35,6 +38,19 @@ public:
     static void setNetworkingEnabled(bool enabled, QObject *ctx, AsyncResult done);
     static void setWirelessEnabled(bool enabled, QObject *ctx, AsyncResult done);
     static void setConnectionAutoconnect(const QString &connectionPath, bool enabled, QObject *ctx, AsyncResult done);
+    // Serialized GetSettings -> mutate -> Update round-trip. Writes to the same
+    // connection queue behind each other so overlapping callers cannot silently
+    // clobber each other's Update (last-writer-wins). Thread-safe; completions
+    // arrive on the calling thread via ctx.
+    static void updateConnectionSettings(const QString &connectionPath,
+                                         QObject *ctx,
+                                         SettingsMutator mutate,
+                                         AsyncResult done);
+    static void setBssidPin(const QString &connectionPath,
+                            const QString &bssid,
+                            QObject *ctx,
+                            AsyncResult done);
+    static void clearBssidPin(const QString &connectionPath, QObject *ctx, AsyncResult done);
     static void addAndActivateWifi(const AccessPointRecord &ap,
                                    const QString &devicePath,
                                    const QString &password,

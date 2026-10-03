@@ -67,6 +67,7 @@ public:
     void feedConnectivity();
     void updateTooltip();
     void onActiveDiff();
+    void setMigrationQuiet(bool quiet);
 
 public:
     QSystemTrayIcon mTrayIcon;
@@ -96,6 +97,7 @@ public:
 
     // configuration
     bool mEnableNotifications; //!< should info about connection establishment etc. be sent by org.freedesktop.Notifications
+    bool mMigrationQuiet = false; //!< while a steering migration runs, onActiveDiff updates bookkeeping silently so one migration emits one notice, not three
     QAction *mActAutoTz = nullptr;
 };
 
@@ -281,6 +283,11 @@ void TrayPrivate::updateTooltip()
     }
 }
 
+void TrayPrivate::setMigrationQuiet(bool quiet)
+{
+    mMigrationQuiet = quiet;
+}
+
 void TrayPrivate::onActiveDiff()
 {
     if (!mEnableNotifications) {
@@ -291,15 +298,19 @@ void TrayPrivate::onActiveDiff()
         current.insert(active.path);
         if (active.state == nm::ActiveState::Activated && !mAnnouncedActive.contains(active.path)) {
             mAnnouncedActive.insert(active.path);
-            sendNotification(Tray::tr("Connection established"),
-                             Tray::tr("Now connected to %1 '%2'.")
-                                 .arg(nm::connectionTypeLabel(active.type), active.id),
-                             QStringLiteral("network-transmit-receive"));
+            if (!mMigrationQuiet) {
+                sendNotification(Tray::tr("Connection established"),
+                                 Tray::tr("Now connected to %1 '%2'.")
+                                     .arg(nm::connectionTypeLabel(active.type), active.id),
+                                 QStringLiteral("network-transmit-receive"));
+            }
         }
     }
     for (auto it = mAnnouncedActive.begin(); it != mAnnouncedActive.end();) {
         if (!current.contains(*it)) {
-            sendNotification(Tray::tr("Connection lost"), Tray::tr("No longer connected."), QStringLiteral("network-offline"));
+            if (!mMigrationQuiet) {
+                sendNotification(Tray::tr("Connection lost"), Tray::tr("No longer connected."), QStringLiteral("network-offline"));
+            }
             it = mAnnouncedActive.erase(it);
         } else {
             ++it;
@@ -392,6 +403,12 @@ Tray::Tray(QObject *parent/* = nullptr*/)
     });
     connect(&d->mNmModel, &NmModel::actionFailed, this, [this](const QString &summary, const QString &detail) {
         d->sendNotification(summary, detail, QStringLiteral("dialog-error"));
+    });
+    connect(&d->mNmModel, &NmModel::migrationUpdate, this, [this](const QString &summary, const QString &detail) {
+        d->sendNotification(summary, detail, QStringLiteral("network-transmit-receive"));
+    });
+    connect(&d->mNmModel, &NmModel::migrationActiveChanged, this, [this](bool active) {
+        d->setMigrationQuiet(active);
     });
     connect(&d->mConnectivity, &nm::ConnectivityMonitor::statusChanged, this, [this] {
         d->refreshIcon();
