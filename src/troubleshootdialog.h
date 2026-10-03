@@ -4,6 +4,7 @@
 #include <QDialog>
 #include <QList>
 #include <QString>
+#include <QStringList>
 
 class QLabel;
 class QPushButton;
@@ -52,6 +53,7 @@ public:
         StHttpPortal,
         StNmVerdict,
         StAlternatives,
+        StApPin,
         StageCount
     };
 
@@ -59,6 +61,7 @@ public:
 
     const QList<DiagResult> &results() const { return mResults; }
     const QList<WifiCandidate> &candidates() const { return mCandidates; }
+    const QStringList &pinnedProfilePaths() const { return mPinnedPaths; }
     QString verdictText() const { return mVerdict; }
     QString suggestedActionId() const { return mAction; }
 
@@ -76,6 +79,7 @@ private:
     NmModel *mModel;
     QList<DiagResult> mResults;
     QList<WifiCandidate> mCandidates;
+    QStringList mPinnedPaths;
     QString mVerdict;
     QString mAction;
 };

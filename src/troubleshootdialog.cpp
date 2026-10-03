@@ -16,6 +16,7 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QPushButton>
+#include <QSharedPointer>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 
@@ -54,6 +55,8 @@ NetDiagnostics::NetDiagnostics(NmModel *model, QObject *parent)
         { tr("HTTP / captive portal") },
         { tr("NetworkManager connectivity verdict") },
         { tr("Alternative saved networks") },
+        // Fully initialized so new stages add no -Wmissing-field-initializers.
+        { tr("Access-point pin"), {}, DiagResult::Verdict::Pending },
     };
 }
 
@@ -64,6 +67,7 @@ void NetDiagnostics::run()
         r.verdict = DiagResult::Verdict::Pending;
     }
     mCandidates.clear();
+    mPinnedPaths.clear();
     mVerdict.clear();
     mAction.clear();
 
@@ -80,6 +84,7 @@ void NetDiagnostics::run()
         set(StDns, DiagResult::Verdict::Skipped);
         set(StHttpPortal, DiagResult::Verdict::Skipped);
         set(StNmVerdict, DiagResult::Verdict::Skipped);
+        set(StApPin, DiagResult::Verdict::Skipped);
         finish();
         return;
     }
@@ -103,6 +108,36 @@ void NetDiagnostics::run()
         const QStringList dns = acIt->ip4Dns + acIt->ip6Dns;
         set(StDns, dns.isEmpty() ? DiagResult::Verdict::Fail : DiagResult::Verdict::Pass,
             dns.isEmpty() ? tr("no DNS servers") : dns.join(QStringLiteral(", ")));
+    }
+
+    QStringList pinDetails;
+    bool pinOutOfRange = false;
+    for (const auto &conn : snap.savedConnections) {
+        if (!nm::isWirelessType(conn.type) || conn.wifiBssid.isEmpty()) {
+            continue;
+        }
+        mPinnedPaths.push_back(conn.path);
+        int strength = -1;
+        for (const auto &ap : snap.accessPoints) {
+            if (ap.bssid.compare(conn.wifiBssid, Qt::CaseInsensitive) == 0) {
+                strength = ap.strength;
+                break;
+            }
+        }
+        if (strength < 0) {
+            pinOutOfRange = true;
+        }
+        pinDetails.push_back(strength < 0
+                                 ? tr("%1: pinned to %2 (not in range)").arg(conn.id, conn.wifiBssid)
+                                 : tr("%1: pinned to %2 (%3%)").arg(conn.id, conn.wifiBssid).arg(strength));
+    }
+    if (mPinnedPaths.isEmpty()) {
+        set(StApPin, DiagResult::Verdict::Pass, tr("no pinned profiles"));
+    } else {
+        set(StApPin,
+            pinOutOfRange ? DiagResult::Verdict::Fail : DiagResult::Verdict::Pass,
+            pinDetails.join(QStringLiteral("; ")));
+        mAction = QStringLiteral("clear-pin");
     }
 
     set(StHttpPortal, DiagResult::Verdict::Running, tr("probing"));
@@ -135,6 +170,9 @@ void NetDiagnostics::run()
                                        : (state.rawConnectivity == 0 ? DiagResult::Verdict::Skipped : DiagResult::Verdict::Fail),
             connectivityName(state.rawConnectivity));
 
+        // Same-SSID APs stay out of this list on purpose: choosing between
+        // them is the steering monitor's job (see the access-point pin stage
+        // above), while this list offers different networks to switch to.
         for (const auto &ap : snap.accessPoints) {
             if (ap.ssid.isEmpty() || ap.ssid == state.primaryName || ap.strength < 25) {
                 continue;
@@ -265,12 +303,45 @@ void TroubleshootDialog::paintVerdict()
     mVerdict->setText(mDiag->verdictText());
 
     const QString act = mDiag->suggestedActionId();
-    mActionBtn->setVisible(act == QLatin1String("portal") || act == QLatin1String("set-dns"));
+    mActionBtn->setVisible(act == QLatin1String("portal") || act == QLatin1String("set-dns")
+                           || act == QLatin1String("clear-pin"));
     mActionBtn->disconnect();
     if (act == QLatin1String("portal")) {
         mActionBtn->setText(tr("Open sign-in page"));
         connect(mActionBtn, &QPushButton::clicked, this, [] {
             QDesktopServices::openUrl(QUrl(QStringLiteral("http://connectivity-check.ubuntu.com/")));
+        });
+    } else if (act == QLatin1String("clear-pin")) {
+        const QStringList paths = mDiag->pinnedProfilePaths();
+        mActionBtn->setText(paths.size() == 1 ? tr("Clear access-point pin")
+                                              : tr("Clear %1 access-point pins").arg(paths.size()));
+        connect(mActionBtn, &QPushButton::clicked, this, [this, paths] {
+            if (paths.isEmpty()) {
+                return;
+            }
+            mActionBtn->setEnabled(false);
+            auto remaining = QSharedPointer<int>::create(paths.size());
+            auto firstErr = QSharedPointer<QString>::create();
+            for (const QString &connPath : paths) {
+                nm::NmActions::clearBssidPin(connPath, this,
+                    [this, paths, remaining, firstErr](bool ok, const QString &err, const QDBusMessage &) {
+                        if (!ok && firstErr->isEmpty()) {
+                            *firstErr = err;
+                        }
+                        if (--(*remaining) != 0) {
+                            return;
+                        }
+                        mActionBtn->setEnabled(true);
+                        if (!firstErr->isEmpty()) {
+                            mVerdict->setText(tr("Could not clear the pin: %1").arg(*firstErr));
+                            return;
+                        }
+                        if (mModel->primaryPhysicalConnectionPath().isEmpty()) {
+                            mModel->activateConnectionPath(paths.first());
+                        }
+                        mDiag->run();
+                    });
+            }
         });
     } else if (act == QLatin1String("set-dns")) {
         mActionBtn->setText(tr("Use public DNS on this connection"));
